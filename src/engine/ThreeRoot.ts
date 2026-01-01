@@ -6,6 +6,8 @@ import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
 
+import { Lensflare, LensflareElement } from "three/examples/jsm/objects/Lensflare.js";
+
 export type GraphicsPreset = "Low" | "Medium" | "High" | "Cinematic++";
 
 export type ThreeRuntime = {
@@ -101,9 +103,9 @@ type BodyInfo = {
   name: string;
   type: string;
   enabled: boolean;
-  pos: THREE.Vector3; // already scaled for rendering/sim
-  radius: number; // already scaled
-  mass: number; // scaled mass (arbitrary)
+  pos: THREE.Vector3; // scaled
+  radius: number; // scaled
+  mass: number; // scaled (arbitrary)
   color: THREE.Color;
   hasRing: boolean;
 };
@@ -197,22 +199,21 @@ export class ThreeRoot {
 
   // asteroids
   private asteroids: Asteroid[] = [];
-  private asteroidMax = 6000; // 충분히 “브러시” 느낌
+  private asteroidMax = 6000;
   private asteroidGeom = new THREE.SphereGeometry(1, 12, 10);
   private asteroidMats: THREE.MeshStandardMaterial[] = [
-    new THREE.MeshStandardMaterial({ color: new THREE.Color(0.55, 0.55, 0.6), roughness: 0.95, metalness: 0.05 }), // rock
-    new THREE.MeshStandardMaterial({ color: new THREE.Color(0.75, 0.85, 0.95), roughness: 0.9, metalness: 0.02 }), // ice
-    new THREE.MeshStandardMaterial({ color: new THREE.Color(0.75, 0.75, 0.78), roughness: 0.6, metalness: 0.65 }), // iron
+    new THREE.MeshStandardMaterial({ color: new THREE.Color(0.55, 0.55, 0.6), roughness: 0.95, metalness: 0.05 }),
+    new THREE.MeshStandardMaterial({ color: new THREE.Color(0.75, 0.85, 0.95), roughness: 0.9, metalness: 0.02 }),
+    new THREE.MeshStandardMaterial({ color: new THREE.Color(0.75, 0.75, 0.78), roughness: 0.6, metalness: 0.65 }),
   ];
   private asteroidMesh: THREE.InstancedMesh;
   private asteroidDummy = new THREE.Object3D();
-  private asteroidCountLive = 0;
 
   // impact FX
   private impacts: ImpactFx[] = [];
   private ringGeo = new THREE.RingGeometry(0.95, 1.0, 96, 1);
 
-  // sim params (defaults if UI/store not wired)
+  // sim params
   private timeScale = 1;
   private paused = false;
   private stepOnce = false;
@@ -220,8 +221,14 @@ export class ThreeRoot {
   // floating origin bookkeeping
   private floatingOrigin = new THREE.Vector3(0, 0, 0);
 
+  // ✅ Sun light + flare
+  private sunMesh: THREE.Mesh | null = null;
+  private sunLight: THREE.PointLight | null = null;
+  private sunFlare: Lensflare | null = null;
+  private flareTex0: THREE.Texture | null = null; // core
+  private flareTex1: THREE.Texture | null = null; // halo
+
   constructor() {
-    // pre-allocate asteroid pool
     this.asteroids = new Array(this.asteroidMax);
     for (let i = 0; i < this.asteroidMax; i++) {
       this.asteroids[i] = {
@@ -234,8 +241,6 @@ export class ThreeRoot {
         ttl: 0,
       };
     }
-
-    // dummy instanced mesh (will be created in initThree once scene exists)
     // @ts-ignore
     this.asteroidMesh = null;
   }
@@ -300,6 +305,8 @@ export class ThreeRoot {
     try {
       this.composer?.dispose();
       this.renderer?.dispose();
+      this.flareTex0?.dispose();
+      this.flareTex1?.dispose();
     } catch {
       // ignore
     }
@@ -416,7 +423,6 @@ export class ThreeRoot {
     }
   }
 
-  // floating origin shift (optional external)
   public applyFloatingOriginShift(shift: THREE.Vector3) {
     if (!this.scene || !this.camera) return;
     this.floatingOrigin.add(shift);
@@ -435,6 +441,94 @@ export class ThreeRoot {
     this.camera.near = lerp(this.camera.near, n, 0.25);
     this.camera.far = lerp(this.camera.far, f, 0.25);
     this.camera.updateProjectionMatrix();
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // ✅ Procedural flare textures + ensure light/flare exist
+  // ───────────────────────────────────────────────────────────────────────────
+  private makeFlareTexture(size: number, kind: "core" | "halo"): THREE.Texture {
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext("2d")!;
+
+    const cx = size * 0.5;
+    const cy = size * 0.5;
+
+    ctx.clearRect(0, 0, size, size);
+
+    if (kind === "core") {
+      const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, size * 0.5);
+      g.addColorStop(0.0, "rgba(255,255,255,1.0)");
+      g.addColorStop(0.12, "rgba(255,250,230,0.95)");
+      g.addColorStop(0.30, "rgba(255,220,160,0.35)");
+      g.addColorStop(1.0, "rgba(255,200,120,0.0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, size, size);
+
+      ctx.globalCompositeOperation = "lighter";
+      ctx.strokeStyle = "rgba(255,240,220,0.08)";
+      ctx.lineWidth = Math.max(1, Math.floor(size * 0.01));
+      for (let i = 0; i < 14; i++) {
+        const a = (i / 14) * Math.PI;
+        const r = size * 0.48;
+        ctx.beginPath();
+        ctx.moveTo(cx - Math.cos(a) * r, cy - Math.sin(a) * r);
+        ctx.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+        ctx.stroke();
+      }
+      ctx.globalCompositeOperation = "source-over";
+    } else {
+      const g = ctx.createRadialGradient(cx, cy, size * 0.10, cx, cy, size * 0.5);
+      g.addColorStop(0.0, "rgba(255,255,255,0.0)");
+      g.addColorStop(0.22, "rgba(255,240,210,0.05)");
+      g.addColorStop(0.40, "rgba(255,220,170,0.10)");
+      g.addColorStop(0.65, "rgba(255,210,140,0.05)");
+      g.addColorStop(1.0, "rgba(255,200,120,0.0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, size, size);
+
+      ctx.globalCompositeOperation = "lighter";
+      ctx.strokeStyle = "rgba(255,240,200,0.08)";
+      ctx.lineWidth = Math.max(1, Math.floor(size * 0.01));
+      ctx.beginPath();
+      ctx.arc(cx, cy, size * 0.22, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalCompositeOperation = "source-over";
+    }
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.needsUpdate = true;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.generateMipmaps = false;
+    return tex;
+  }
+
+  private ensureSunLightAndFlare() {
+    if (!this.scene) return;
+
+    if (!this.flareTex0) this.flareTex0 = this.makeFlareTexture(256, "core");
+    if (!this.flareTex1) this.flareTex1 = this.makeFlareTexture(256, "halo");
+
+    if (!this.sunLight) {
+      // PointLight at sun position
+      this.sunLight = new THREE.PointLight(0xffffff, 6.0, 0, 2.0);
+      this.sunLight.name = "sunLight";
+      this.sunLight.castShadow = false;
+      this.scene.add(this.sunLight);
+    }
+
+    if (!this.sunFlare) {
+      this.sunFlare = new Lensflare();
+      this.sunFlare.addElement(new LensflareElement(this.flareTex0!, 450, 0.0, new THREE.Color(1.0, 0.95, 0.85)));
+      this.sunFlare.addElement(new LensflareElement(this.flareTex1!, 160, 0.35, new THREE.Color(1.0, 0.85, 0.55)));
+      this.sunFlare.addElement(new LensflareElement(this.flareTex1!, 240, 0.55, new THREE.Color(0.9, 0.8, 1.0)));
+      this.sunFlare.addElement(new LensflareElement(this.flareTex1!, 120, 0.75, new THREE.Color(1.0, 0.9, 0.75)));
+      this.sunFlare.name = "sunFlare";
+      this.sunLight.add(this.sunFlare);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -478,22 +572,15 @@ export class ThreeRoot {
     this.controls.enableZoom = true;
     this.controls.minDistance = 0.5;
     this.controls.maxDistance = 5e7;
-
-    // IMPORTANT: RMB rotate mapping
     this.controls.mouseButtons = {
       LEFT: THREE.MOUSE.PAN,
       MIDDLE: THREE.MOUSE.DOLLY,
       RIGHT: THREE.MOUSE.ROTATE,
     };
 
-    // Lights
-    const hemi = new THREE.HemisphereLight(0x8899aa, 0x111122, 0.25);
+    // Lights (ambient-ish)
+    const hemi = new THREE.HemisphereLight(0x8899aa, 0x111122, 0.18);
     this.scene.add(hemi);
-
-    const dir = new THREE.DirectionalLight(0xffffff, 1.2);
-    dir.position.set(50, 30, 20);
-    dir.castShadow = false;
-    this.scene.add(dir);
 
     // Groups
     this.worldGroup = new THREE.Group();
@@ -554,7 +641,6 @@ export class ThreeRoot {
       this.pointerButton = e.button;
       this.shiftDown = e.shiftKey;
 
-      // LMB + no shift => selection
       if (e.button === 0 && !e.shiftKey) {
         this.pickAtClient(e.clientX, e.clientY);
       }
@@ -566,8 +652,6 @@ export class ThreeRoot {
 
     const onPointerMove = (e: PointerEvent) => {
       this.shiftDown = e.shiftKey;
-
-      // Shift+LMB brush spawn
       if (this.pointerDown && this.pointerButton === 0 && this.shiftDown) {
         this.brushSpawn();
       }
@@ -642,11 +726,9 @@ export class ThreeRoot {
     const instFps = 1 / dtRaw;
     this.fps = lerp(this.fps, instFps, 0.12);
 
-    // state read
     const state = this.store?.getState?.() ?? this.lastWorldSnapshot;
     this.applyCommonSettings(state);
 
-    // time step
     let dt = dtRaw * this.timeScale;
     if (this.paused) dt = 0;
     if (this.stepOnce) {
@@ -655,31 +737,25 @@ export class ThreeRoot {
     }
     this.time += dt;
 
-    // update world meshes
     const bodies = this.applyWorldStateToScene(state);
 
-    // track selected -> controls target
     if (this.trackingSelected && this.selectedId && this.bodyMeshes.has(this.selectedId)) {
       const m = this.bodyMeshes.get(this.selectedId)!;
       this.controls.target.lerp(m.position, 0.18);
     }
 
-    // asteroid simulation + collisions
     if (dt > 0) {
       this.updateAsteroids(dt, bodies);
       this.updateImpacts(dt);
     }
 
-    // controls update
     this.controls.update();
 
-    // instanced cache
     const frame = this.renderer.info.render.frame ?? 0;
     if (frame % this.instancedEveryNFrames === 0) {
       this.instancedCached = countInstancedInstances(this.scene);
     }
 
-    // render
     if (this.postprocessEnabled) {
       this.bloomPass.enabled = this.bloomEnabled;
       this.composer.render();
@@ -687,7 +763,6 @@ export class ThreeRoot {
       this.renderer.render(this.scene, this.camera);
     }
 
-    // runtime sink
     if (this.runtimeSink) {
       const r = this.renderer.info.render;
       this.runtimeSink({
@@ -709,10 +784,8 @@ export class ThreeRoot {
   };
 
   private applyCommonSettings(state: any) {
-    // time flow
     this.timeScale = Math.max(0.0001, num(state?.timeScale ?? state?.time?.scale ?? state?.sim?.timeScale, 1));
 
-    // graphics toggles
     const post = state?.settings?.postprocess;
     if (typeof post === "boolean") this.postprocessEnabled = post;
 
@@ -728,28 +801,31 @@ export class ThreeRoot {
   // ───────────────────────────────────────────────────────────────────────────
   private brushSpawn() {
     const now = performance.now();
-    const minIntervalMs = 24; // ~40Hz brush
+    const minIntervalMs = 24;
     if (now - this.lastBrushSpawn < minIntervalMs) return;
     this.lastBrushSpawn = now;
 
-    // spawn batch (feels like spray)
     const count = 6;
 
-    // get a decent target direction (camera forward)
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
     safeNormalize(forward);
 
-    // spawn start a bit in front of camera
     const origin = this.camera.position.clone().add(forward.clone().multiplyScalar(2.0));
 
     for (let i = 0; i < count; i++) {
       const spread = 0.06;
       const dir = forward
         .clone()
-        .add(new THREE.Vector3((Math.random() - 0.5) * spread, (Math.random() - 0.5) * spread, (Math.random() - 0.5) * spread));
+        .add(
+          new THREE.Vector3(
+            (Math.random() - 0.5) * spread,
+            (Math.random() - 0.5) * spread,
+            (Math.random() - 0.5) * spread
+          )
+        );
       safeNormalize(dir);
 
-      const speed = 12 + 18 * Math.random(); // tweakable
+      const speed = 12 + 18 * Math.random();
       const radius = 0.04 + 0.08 * Math.random();
       const mass = 1.0 + 8.0 * Math.random();
       const mat = (Math.random() < 0.65 ? 0 : Math.random() < 0.85 ? 1 : 2) as 0 | 1 | 2;
@@ -759,7 +835,6 @@ export class ThreeRoot {
   }
 
   private spawnAsteroid(pos: THREE.Vector3, vel: THREE.Vector3, radius: number, mass: number, mat: 0 | 1 | 2) {
-    // find a free slot
     for (let i = 0; i < this.asteroids.length; i++) {
       const a = this.asteroids[i];
       if (!a.alive) {
@@ -769,16 +844,14 @@ export class ThreeRoot {
         a.radius = radius;
         a.mass = mass;
         a.mat = mat;
-        a.ttl = 90; // seconds
-        this.asteroidCountLive++;
+        a.ttl = 90;
         return;
       }
     }
   }
 
   private updateAsteroids(dt: number, bodies: BodyInfo[]) {
-    // simple gravity constant scale
-    const G = 0.08; // arbitrary but feels OK in scaled space
+    const G = 0.08;
 
     let instIdx = 0;
 
@@ -786,14 +859,12 @@ export class ThreeRoot {
       const a = this.asteroids[i];
       if (!a.alive) continue;
 
-      // TTL
       a.ttl -= dt;
       if (a.ttl <= 0) {
         a.alive = false;
         continue;
       }
 
-      // apply gravity from the “most influential” body (max GM/r^2)
       let best: BodyInfo | null = null;
       let bestAcc = 0;
 
@@ -812,15 +883,12 @@ export class ThreeRoot {
         const to = best.pos.clone().sub(a.pos);
         const r2 = Math.max(1e-6, to.lengthSq());
         safeNormalize(to);
-        // a = GM/r^2
         const acc = (G * best.mass) / r2;
         a.vel.addScaledVector(to, acc * dt);
       }
 
-      // integrate
       a.pos.addScaledVector(a.vel, dt);
 
-      // collision with bodies (sphere)
       let hitBody: BodyInfo | null = null;
       for (const b of bodies) {
         const r = b.radius + a.radius;
@@ -831,32 +899,30 @@ export class ThreeRoot {
       }
 
       if (hitBody) {
-        // energy = 1/2 m v^2
         const v2 = a.vel.lengthSq();
         const energy = 0.5 * a.mass * v2;
 
-        // impact normal from body center to hit point
         const normal = a.pos.clone().sub(hitBody.pos);
         safeNormalize(normal);
 
         this.spawnImpact(hitBody.pos.clone().add(normal.clone().multiplyScalar(hitBody.radius)), normal, energy);
 
-        // remove asteroid
         a.alive = false;
         continue;
       }
 
-      // write to instanced mesh
       this.asteroidDummy.position.copy(a.pos);
       this.asteroidDummy.scale.setScalar(a.radius);
       this.asteroidDummy.updateMatrix();
 
-      // swap material per instance isn't supported directly; so we approximate:
-      // encode mat by slight emissive tint using instanceColor
-      const col = a.mat === 0 ? new THREE.Color(0.7, 0.7, 0.75) : a.mat === 1 ? new THREE.Color(0.85, 0.92, 1.0) : new THREE.Color(0.85, 0.85, 0.88);
+      const col =
+        a.mat === 0
+          ? new THREE.Color(0.7, 0.7, 0.75)
+          : a.mat === 1
+          ? new THREE.Color(0.85, 0.92, 1.0)
+          : new THREE.Color(0.85, 0.85, 0.88);
 
       this.asteroidMesh.setMatrixAt(instIdx, this.asteroidDummy.matrix);
-      // instanceColor exists when enabled
       if (!this.asteroidMesh.instanceColor) {
         const arr = new Float32Array(this.asteroidMax * 3);
         this.asteroidMesh.instanceColor = new THREE.InstancedBufferAttribute(arr, 3);
@@ -873,7 +939,6 @@ export class ThreeRoot {
   }
 
   private spawnImpact(pos: THREE.Vector3, normal: THREE.Vector3, energy: number) {
-    // flash sprite
     const spriteMat = new THREE.SpriteMaterial({
       color: new THREE.Color(1, 1, 1),
       transparent: true,
@@ -887,7 +952,6 @@ export class ThreeRoot {
     flash.scale.setScalar(clamp(s, 0.35, 3.5));
     this.fxGroup.add(flash);
 
-    // shockwave ring (tangent plane)
     const ringMat = new THREE.MeshBasicMaterial({
       color: new THREE.Color(0.9, 0.95, 1.0),
       transparent: true,
@@ -898,7 +962,6 @@ export class ThreeRoot {
     });
     const ring = new THREE.Mesh(this.ringGeo, ringMat);
     ring.position.copy(pos.clone().add(normal.clone().multiplyScalar(0.02)));
-    // orient ring to face outwards along normal
     const up = new THREE.Vector3(0, 1, 0);
     const q = new THREE.Quaternion().setFromUnitVectors(up, normal.clone());
     ring.quaternion.copy(q);
@@ -915,7 +978,6 @@ export class ThreeRoot {
       ring,
     });
 
-    // bloom을 “절제된” 순간에만 조금 타게 유도
     if (this.bloomPass) {
       this.bloomPass.strength = clamp(this.bloomPass.strength + 0.06, 0.18, 0.55);
     }
@@ -927,12 +989,10 @@ export class ThreeRoot {
       fx.t += dt;
       const u = clamp(fx.t / fx.dur, 0, 1);
 
-      // flash fades quickly
       const flashOp = (1 - u) * (1 - u);
       (fx.flash.material as THREE.SpriteMaterial).opacity = flashOp;
       fx.flash.scale.setScalar((0.6 + Math.log10(fx.energy + 1) * 0.35) * (1 + 0.6 * u));
 
-      // ring expands + fades
       const ringScale = 0.12 + (0.9 + Math.log10(fx.energy + 1) * 0.25) * u;
       fx.ring.scale.setScalar(ringScale);
       (fx.ring.material as THREE.MeshBasicMaterial).opacity = (1 - u) * 0.85;
@@ -946,9 +1006,9 @@ export class ThreeRoot {
       }
     }
 
-    // bloom restore gently
     if (this.bloomPass) {
-      const base = this.preset === "Cinematic++" ? 0.38 : this.preset === "High" ? 0.34 : this.preset === "Medium" ? 0.26 : 0.18;
+      const base =
+        this.preset === "Cinematic++" ? 0.38 : this.preset === "High" ? 0.34 : this.preset === "Medium" ? 0.26 : 0.18;
       this.bloomPass.strength = lerp(this.bloomPass.strength, base, 0.05);
     }
   }
@@ -964,7 +1024,6 @@ export class ThreeRoot {
     const radiusScale = Math.max(1e-6, num(state?.scales?.radius ?? state?.radiusScale, 1));
     const massScale = Math.max(1e-6, num(state?.scales?.mass ?? state?.massScale, 1));
 
-    // remove missing
     const alive = new Set<string>();
     for (const b of bodiesRaw) {
       if (!b) continue;
@@ -991,6 +1050,9 @@ export class ThreeRoot {
 
     const infos: BodyInfo[] = [];
 
+    // reset sun refs each frame (will be re-found)
+    this.sunMesh = null;
+
     for (const b of bodiesRaw) {
       if (!b || b.enabled === false) continue;
       const id = String(b.id ?? b.name ?? "");
@@ -1002,7 +1064,6 @@ export class ThreeRoot {
       const baseRadius = Math.max(0.001, num(b.radius ?? b.r ?? b.size, 1));
       const radius = baseRadius * radiusScale;
 
-      // position scaled
       const pos = vec3FromBody(b).multiplyScalar(distanceScale);
 
       const baseMass = Math.max(0.001, num(b.mass ?? b.m ?? 1, 1));
@@ -1028,12 +1089,19 @@ export class ThreeRoot {
       mesh.position.copy(pos);
       mesh.scale.setScalar(radius);
 
-      // highlight selection
+      const isSun = type === "sun" || name.toLowerCase() === "sun";
       const mat = mesh.material as THREE.MeshStandardMaterial;
-      const isSel = this.selectedId === id;
-      mat.emissiveIntensity = (type === "sun" ? 1.0 : 0.0) + (isSel ? 0.45 : 0.0);
 
-      // rings (saturn-like)
+      // selection highlight
+      const isSel = this.selectedId === id;
+      mat.emissiveIntensity = (isSun ? (this.preset === "Cinematic++" ? 1.35 : 1.0) : 0.0) + (isSel ? 0.45 : 0.0);
+
+      // ✅ register sun + ensure light/flare exist
+      if (isSun) {
+        this.sunMesh = mesh;
+        this.ensureSunLightAndFlare();
+      }
+
       const wantsRing = !!b.hasRing || name.toLowerCase().includes("saturn");
       if (wantsRing) {
         let ring = this.ringMeshes.get(id);
@@ -1084,9 +1152,18 @@ export class ThreeRoot {
       });
     }
 
-    // if nothing is selected, default target is origin
+    // ✅ sync sun light + flare to sun mesh
+    if (this.sunMesh && this.sunLight) {
+      this.sunLight.position.copy(this.sunMesh.position);
+
+      const sunRadius = this.sunMesh.scale.x;
+      const presetBoost =
+        this.preset === "Cinematic++" ? 1.25 : this.preset === "High" ? 1.1 : this.preset === "Medium" ? 0.95 : 0.8;
+
+      this.sunLight.intensity = clamp(4.0 * presetBoost * Math.sqrt(Math.max(0.2, sunRadius)), 2.0, 18.0);
+    }
+
     if (!this.selectedId && infos.length > 0) {
-      // try focus sun if exists
       const sun = infos.find((x) => x.type === "sun" || x.name.toLowerCase() === "sun");
       if (sun) {
         this.selectedId = sun.id;
