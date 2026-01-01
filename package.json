@@ -1,0 +1,28 @@
+{
+  "name": "cosmic-sandbox-cinematic",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@dimforge/rapier3d-compat": "^0.12.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "three": "^0.165.0",
+    "zustand": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@types/three": "^0.165.0",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.41",
+    "tailwindcss": "^3.4.10",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.2"
+  }
+}
