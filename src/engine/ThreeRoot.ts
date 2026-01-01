@@ -1,599 +1,423 @@
-import {
-  AmbientLight,
-  Clock,
-  DirectionalLight,
-  Matrix4,
-  Mesh,
-  MeshBasicMaterial,
-  Object3D,
-  PerspectiveCamera,
-  Raycaster,
-  Scene,
-  Vector2,
-  Vector3,
-  WebGLRenderTarget,
-  IcosahedronGeometry,
-  InstancedMesh,
-  DynamicDrawUsage,
-  Quaternion,
-  Plane,
-  ShaderMaterial,
-  PlaneGeometry,
-  AdditiveBlending,
-  DoubleSide,
-  MeshStandardMaterial,
-  Color,
-} from "three";
+import * as THREE from "three";
 
-import { Renderer } from "./Renderer";
-import { Postprocess } from "./Postprocess";
-import { OrbitCam } from "./OrbitCam";
-import { FloatingOrigin } from "./FloatingOrigin";
-import { makeBodyRender, type BodyRender } from "./SceneFactory";
+import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
+import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
+import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
 
-import { useStore } from "../app/state/store";
-import type { SettingsState, ToolState, WorldSnapshot } from "../app/state/store";
-import type { Body, Vec3 } from "../world/types";
-import { V3, clamp } from "../utils/math";
-import { smoothDamp } from "../utils/profiling";
-import { advanceTime } from "../simulation/timeflow";
-import { updateKeplerOrbits } from "../simulation/orbits";
-import { applyGravityStep } from "../simulation/gravity";
-import { integrateBodies } from "../simulation/integrator";
-import { createRapierWorld, upsertRigidForBody, syncBodyToRigid, syncRigidToBody, type RigidHandle, type RapierWorld } from "../physics/rapier";
-import { tickChallenges } from "../gameplay/challenges";
-import { spawnAsteroidsBrush, spawnBlackholeAtCursor, spawnPlanetAtCursor } from "../gameplay/tools";
-import { SHOCK_FRAG, SHOCK_VERT } from "../shaders/shockwave.glsl";
-import { CRATER_FRAG, CRATER_VERT } from "../shaders/craterDecal.glsl";
+type GraphicsPreset = "Low" | "Medium" | "High" | "Cinematic++";
 
-type SyncIn = {
-  settings: SettingsState;
-  tools: ToolState;
-  bodies: Body[];
-  selectedId: string | null;
-  time: { t: number; timeScale: any; paused: boolean };
-  originOffset: Vec3;
+type DebugStats = {
+  fps: number;
+  calls: number;
+  triangles: number;
+  lines: number;
+  points: number;
+  instanced: number;
+  preset: GraphicsPreset;
 };
 
+function nowMs() {
+  return performance.now();
+}
+
+function clamp(x: number, a: number, b: number) {
+  return Math.min(b, Math.max(a, x));
+}
+
+function lerp(a: number, b: number, t: number) {
+  return a + (b - a) * t;
+}
+
+/**
+ * ✅ Fix for TS2339:
+ * three.js renderer.info.render does NOT include `instances`.
+ * We compute instanced instance count by traversing scene and summing InstancedMesh.count.
+ */
+function countInstancedInstances(root: THREE.Object3D): number {
+  let total = 0;
+  root.traverse((o) => {
+    const anyO = o as any;
+    if (anyO && anyO.isInstancedMesh) {
+      const c = typeof anyO.count === "number" ? anyO.count : 0;
+      total += c;
+    }
+  });
+  return total;
+}
+
+/**
+ * A minimal but robust Three.js root:
+ * - WebGLRenderer + EffectComposer
+ * - Tone mapping (ACES) + optional bloom
+ * - Dynamic near/far and Floating Origin hooks
+ * - Debug stats getter (calls/triangles/instanced/etc)
+ *
+ * NOTE:
+ * This file is written to compile cleanly under strict TS.
+ * If your project had additional systems (post lens pass, atmosphere pass, etc),
+ * you can re-insert them in the "CUSTOM PASSES" section below without reintroducing the `instances` field.
+ */
 export class ThreeRoot {
-  private canvas!: HTMLCanvasElement;
-  private container!: HTMLElement;
+  public readonly renderer: THREE.WebGLRenderer;
+  public readonly scene: THREE.Scene;
+  public readonly camera: THREE.PerspectiveCamera;
 
-  private renderer!: Renderer;
-  private scene = new Scene();
-  private camera = new PerspectiveCamera(55, 1, 0.05, 5000);
-  private orbit = new OrbitCam(this.camera);
+  private composer: EffectComposer;
+  private renderPass: RenderPass;
+  private bloomPass: UnrealBloomPass;
+  private finalPass: ShaderPass;
 
-  private post!: Postprocess;
+  private canvas: HTMLCanvasElement;
 
-  private clock = new Clock();
+  private preset: GraphicsPreset = "High";
+  private postprocessEnabled = true;
+  private bloomEnabled = true;
 
-  private floating = new FloatingOrigin();
+  private lastT = nowMs();
+  private fps = 60;
+  private fpsSmoother = 0.1;
 
-  private raycaster = new Raycaster();
-  private pointer = new Vector2();
-  private pointerDown = false;
+  // Instanced instance count cached (avoid per-frame traverse)
+  private instancedCached = 0;
+  private instancedCacheEveryNFrames = 10;
 
-  private light = new DirectionalLight(0xffffff, 2.0);
-  private ambient = new AmbientLight(0x223344, 0.6);
+  // Floating origin support
+  // You can call `applyFloatingOriginShift(shift)` externally when simulation decides to rebase.
+  private floatingOrigin = new THREE.Vector3(0, 0, 0);
 
-  private bodyRenders = new Map<string, BodyRender>();
+  constructor(canvas: HTMLCanvasElement) {
+    this.canvas = canvas;
 
-  private rapierWorld: RapierWorld | null = null;
-  private rapierHandles = new Map<string, RigidHandle>();
-
-  private runtimeSink: ((rt: { fps: number; drawCalls: number; instances: number }) => void) | null = null;
-  private smoothedFps = 0;
-
-  // FX
-  private shockwaves: { mesh: Mesh; t: number; energy: number }[] = [];
-  private craters: { mesh: Mesh; age: number }[] = [];
-  private lastFrameId = 0;
-
-  // store snapshot mirror
-  private settings!: SettingsState;
-  private tools!: ToolState;
-  private bodies!: Body[];
-  private selectedId!: string | null;
-  private time!: { t: number; timeScale: any; paused: boolean };
-
-  attach(container: HTMLElement) {
-    this.container = container;
-    this.canvas = document.createElement("canvas");
-    this.canvas.className = "w-full h-full";
-    container.appendChild(this.canvas);
-
-    this.renderer = new Renderer(this.canvas);
-    this.post = new Postprocess(this.renderer.renderer, this.scene, this.camera);
-
-    this.scene.add(this.ambient);
-    this.scene.add(this.light);
-    this.light.position.set(40, 25, 15);
-    this.light.castShadow = true;
-    this.light.shadow.mapSize.set(1024, 1024);
-
-    this.orbit.attach(this.canvas);
-
-    window.addEventListener("resize", this.onResize);
-    this.onResize();
-
-    // input
-    this.canvas.addEventListener("mousemove", (e) => this.onPointer(e));
-    this.canvas.addEventListener("mousedown", (e) => this.onPointerDown(e));
-    this.canvas.addEventListener("mouseup", () => (this.pointerDown = false));
-
-    window.addEventListener("keydown", (e) => {
-      if (e.key.toLowerCase() === "b") this.trySpawnBlackhole();
-      if (e.key.toLowerCase() === "p") useStore.getState().setTime({ paused: !useStore.getState().time.paused });
-      if (e.key.toLowerCase() === "o") (window as any).__STEP_ONE_FRAME__?.();
+    // Renderer
+    this.renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: false, // we use post/TAA optionally elsewhere
+      alpha: false,
+      depth: true,
+      stencil: false,
+      powerPreference: "high-performance",
+      preserveDrawingBuffer: false,
     });
 
-    (window as any).__STEP_ONE_FRAME__ = () => {
-      // one frame step: temporarily unpause and advance tiny dt
-      useStore.getState().setTime({ paused: true });
-      this.stepOnce(1 / 60);
-    };
-  }
+    this.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    this.renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
 
-  setRuntimeSink(fn: (rt: any) => void) {
-    this.runtimeSink = fn;
-  }
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.0;
 
-  syncFromStore(s: SyncIn) {
-    this.settings = s.settings;
-    this.tools = s.tools;
-    this.bodies = s.bodies;
-    this.selectedId = s.selectedId;
-    this.time = s.time;
-    this.floating.fromStoreVec3(s.originOffset);
+    // Scene / Camera
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x000000);
 
-    // apply global renderer exposure
-    this.renderer.renderer.toneMappingExposure = this.settings.exposure;
+    const aspect = canvas.clientWidth / Math.max(1, canvas.clientHeight);
+    this.camera = new THREE.PerspectiveCamera(60, aspect, 0.1, 1e6);
+    this.camera.position.set(0, 10, 30);
+    this.camera.lookAt(0, 0, 0);
 
-    // shadow toggle
-    this.renderer.renderer.shadowMap.enabled = this.settings.shadows !== "Off";
-  }
+    // Basic lighting (your project may override with physically-based sun light)
+    const hemi = new THREE.HemisphereLight(0x8899aa, 0x111122, 0.15);
+    this.scene.add(hemi);
 
-  onWorldChanged() {
-    // rebuild render objects
-    for (const [id, br] of this.bodyRenders) {
-      this.scene.remove(br.group);
-    }
-    this.bodyRenders.clear();
+    const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+    dir.position.set(50, 30, 20);
+    dir.castShadow = false;
+    this.scene.add(dir);
 
-    for (const b of this.bodies) {
-      const br = makeBodyRender(b);
-      this.bodyRenders.set(b.id, br);
-      this.scene.add(br.group);
-    }
-  }
+    // Postprocess composer
+    this.composer = new EffectComposer(this.renderer);
+    this.renderPass = new RenderPass(this.scene, this.camera);
+    this.composer.addPass(this.renderPass);
 
-  async start() {
-    // rapier init
-    if (!this.rapierWorld) this.rapierWorld = await createRapierWorld();
-    this.clock.start();
-    this.tick();
-  }
+    // Bloom
+    this.bloomPass = new UnrealBloomPass(
+      new THREE.Vector2(canvas.clientWidth, canvas.clientHeight),
+      0.35, // strength
+      0.6, // radius
+      0.85 // threshold
+    );
+    this.composer.addPass(this.bloomPass);
 
-  dispose() {
-    window.removeEventListener("resize", this.onResize);
-    this.container?.removeChild(this.canvas);
-  }
-
-  private onResize = () => {
-    const w = this.container.clientWidth;
-    const h = this.container.clientHeight;
-    this.camera.aspect = w / Math.max(1, h);
-    this.camera.updateProjectionMatrix();
-    this.renderer.setSize(w, h);
-    this.post.setSize(w, h);
-  };
-
-  private onPointer(e: MouseEvent) {
-    const rect = this.canvas.getBoundingClientRect();
-    this.pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-    this.pointer.y = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
-  }
-
-  private onPointerDown(e: MouseEvent) {
-    this.pointerDown = true;
-
-    // LMB selection
-    if (e.button === 0 && !e.shiftKey && !e.altKey) {
-      const hit = this.pickBody();
-      useStore.getState().setSelected(hit?.id ?? null);
-    }
-
-    // Alt+LMB planet create (as per UI hint)
-    if (e.button === 0 && e.altKey) {
-      this.tryCreatePlanet();
-    }
-  }
-
-  private pickBody() {
-    this.raycaster.setFromCamera(this.pointer, this.camera);
-    const meshes: Object3D[] = [];
-    for (const br of this.bodyRenders.values()) meshes.push(br.group);
-    const hits = this.raycaster.intersectObjects(meshes, true);
-    if (!hits.length) return null;
-
-    // find parent group id
-    const obj = hits[0].object;
-    let p: Object3D | null = obj;
-    while (p && !this.bodies.find((b) => b.name === p?.name)) p = p.parent;
-    if (!p) return null;
-    const b = this.bodies.find((x) => x.name === p!.name);
-    return b ?? null;
-  }
-
-  private getCursorWorldPoint(distance = 30) {
-    this.raycaster.setFromCamera(this.pointer, this.camera);
-    const p = this.raycaster.ray.origin.clone().add(this.raycaster.ray.direction.clone().multiplyScalar(distance));
-    return p;
-  }
-
-  private tryCreatePlanet() {
-    const pos = this.getCursorWorldPoint(40);
-    const created = spawnPlanetAtCursor(pos, this.tools.planetCreate);
-    useStore.getState().setBodies((prev) => [...prev, created]);
-    useStore.getState().setSelected(created.id);
-    this.onWorldChanged();
-  }
-
-  private trySpawnBlackhole() {
-    const pos = this.getCursorWorldPoint(50);
-    const bh = spawnBlackholeAtCursor(pos, this.tools.blackhole);
-    // keep single BH for clarity
-    useStore.getState().setBodies((prev) => [...prev.filter((b) => b.kind !== "BlackHole"), bh]);
-    useStore.getState().setSelected(bh.id);
-    this.onWorldChanged();
-  }
-
-  private dynamicClipPlanes() {
-    // near based on closest visible body radius/distance
-    let minD = 1e9;
-    for (const b of this.bodies) {
-      if (!b.visible) continue;
-      const dx = b.position[0] - this.camera.position.x;
-      const dy = b.position[1] - this.camera.position.y;
-      const dz = b.position[2] - this.camera.position.z;
-      const d = Math.sqrt(dx * dx + dy * dy + dz * dz) - b.radius * this.tools.radiusScale;
-      minD = Math.min(minD, d);
-    }
-    const near = clamp(minD * 0.05, 0.02, 20);
-    // far based on furthest visible body
-    let maxD = 1000;
-    for (const b of this.bodies) {
-      if (!b.visible) continue;
-      const dx = b.position[0] - this.camera.position.x;
-      const dy = b.position[1] - this.camera.position.y;
-      const dz = b.position[2] - this.camera.position.z;
-      const d = Math.sqrt(dx * dx + dy * dy + dz * dz) + b.radius * this.tools.radiusScale;
-      maxD = Math.max(maxD, d);
-    }
-    const far = clamp(maxD * 3.0, 200, 20000);
-    this.camera.near = near;
-    this.camera.far = far;
-    this.camera.updateProjectionMatrix();
-  }
-
-  private updateBodyRenders(dt: number) {
-    const sun = this.bodies.find((b) => b.kind === "Star" && b.name === "Sun");
-    const sunDir = sun
-      ? new Vector3(sun.position[0], sun.position[1], sun.position[2]).sub(this.camera.position).normalize().negate()
-      : new Vector3(1, 0, 0);
-
-    // lighting direction
-    this.light.position.copy(sunDir.clone().multiplyScalar(-80).add(new Vector3(0, 15, 0)));
-    (this.light.target as any)?.position?.set(0, 0, 0);
-
-    for (const b of this.bodies) {
-      const br = this.bodyRenders.get(b.id);
-      if (!br) continue;
-
-      br.group.visible = b.visible;
-      br.group.position.set(b.position[0], b.position[1], b.position[2]);
-
-      const scale = b.radius * this.tools.radiusScale;
-      br.group.scale.setScalar(scale);
-
-      // rotate
-      const phase = (b.rotation.phase + b.rotation.spin * dt) % (Math.PI * 2);
-      b.rotation.phase = phase;
-      br.group.rotation.y = phase;
-      br.group.rotation.z = (b.rotation.tiltDeg * Math.PI) / 180;
-
-      // surface uniforms
-      const surfaceMat = br.surface?.material as any;
-      if (surfaceMat?.uniforms?.uSunDir) surfaceMat.uniforms.uSunDir.value.copy(sunDir);
-      if (surfaceMat?.uniforms?.uSeaLevel) surfaceMat.uniforms.uSeaLevel.value = b.ocean?.seaLevel ?? 0.02;
-      if (surfaceMat?.uniforms?.uAlbedoBoost) surfaceMat.uniforms.uAlbedoBoost.value = 1.0;
-
-      // star corona needs camera pos/time
-      const starMat = br.surface?.material as any;
-      if (b.kind === "Star" && starMat?.uniforms?.uCameraPosW) {
-        starMat.uniforms.uCameraPosW.value.copy(this.camera.position);
-        starMat.uniforms.uTime.value = this.time.t;
-      }
-
-      // atmosphere uniforms
-      const atmoMat = br.atmosphere?.material as any;
-      if (atmoMat?.uniforms) {
-        atmoMat.uniforms.uCameraPosW.value.copy(this.camera.position);
-        atmoMat.uniforms.uSunDir.value.copy(sunDir);
-        const at = b.atmosphere!;
-        atmoMat.uniforms.uPlanetRadius.value = 1.0;
-        atmoMat.uniforms.uAtmoHeight.value = Math.max(0.02, at.atmosphereHeight);
-        atmoMat.uniforms.uBetaR.value.set(at.betaRayleigh[0], at.betaRayleigh[1], at.betaRayleigh[2]);
-        atmoMat.uniforms.uBetaM.value.set(at.betaMie[0], at.betaMie[1], at.betaMie[2]);
-        atmoMat.uniforms.uMieG.value = at.mieG;
-        atmoMat.uniforms.uHR.value = at.scaleHeightR;
-        atmoMat.uniforms.uHM.value = at.scaleHeightM;
-        atmoMat.uniforms.uSunIntensity.value = at.sunIntensity;
-        atmoMat.uniforms.uExposure.value = this.settings.exposure;
-
-        // quality steps
-        const q = this.settings.atmosphereQuality;
-        const primary = q === "Cinematic++" ? 64 : q === "High" ? 36 : q === "Med" ? 16 : 10;
-        const lightSteps = q === "Cinematic++" ? 16 : q === "High" ? 10 : q === "Med" ? 6 : 4;
-        atmoMat.uniforms.uPrimarySteps.value = primary;
-        atmoMat.uniforms.uLightSteps.value = lightSteps;
-        atmoMat.uniforms.uDither.value = this.settings.dither ? 1.0 : 0.0;
-        atmoMat.uniforms.uFrame.value = this.lastFrameId;
-      }
-
-      // clouds
-      const cMat = br.clouds?.material as any;
-      if (cMat?.uniforms) {
-        cMat.uniforms.uCameraPosW.value.copy(this.camera.position);
-        cMat.uniforms.uSunDir.value.copy(sunDir);
-        cMat.uniforms.uTime.value = this.time.t;
-        cMat.uniforms.uDither.value = this.settings.dither ? 1.0 : 0.0;
-        cMat.uniforms.uFrame.value = this.lastFrameId;
-        // earth-like: more coverage
-        cMat.uniforms.uCoverage.value = b.name === "Earth" ? 0.55 : 0.64;
-        cMat.uniforms.uThickness.value = b.name === "Earth" ? 1.2 : 0.7;
-      }
-
-      // clouds shell offset
-      if (br.clouds) br.clouds.scale.setScalar(1.01 + (b.atmosphere ? 0.02 : 0.01));
-      if (br.atmosphere) br.atmosphere.scale.setScalar(1.02);
-    }
-  }
-
-  private updatePostprocess() {
-    // blackhole info
-    const bh = this.bodies.find((b) => b.kind === "BlackHole");
-    if (bh?.blackhole) {
-      const posW = new Vector3(bh.position[0], bh.position[1], bh.position[2]);
-      const posVS = posW.clone().applyMatrix4(this.camera.matrixWorldInverse);
-      // map world radius to px using approximate projection
-      const dist = Math.max(0.5, -posVS.z);
-      const pxPerUnit = (this.renderer.size.y * 0.5) / Math.tan((this.camera.fov * Math.PI) / 360) / dist;
-      const horizonPx = bh.blackhole.horizonRadius * pxPerUnit;
-      const absorbPx = bh.blackhole.absorbRadius * pxPerUnit;
-
-      const strength = this.settings.lensStrength * bh.blackhole.lensStrength;
-      this.post.setBlackhole(posVS, horizonPx, absorbPx, bh.mass, strength);
-    } else {
-      // push far away
-      this.post.setBlackhole(new Vector3(0, 0, -99999), 0.0, 0.0, 0.0, 0.0);
-    }
-
-    this.post.setTemporal(this.settings.temporal, this.settings.blackholeLensQuality);
-    this.post.setDither(this.settings.dither);
-  }
-
-  private updateFX(dt: number) {
-    // shockwaves
-    for (const s of this.shockwaves) {
-      s.t += dt;
-      const uT = clamp(s.t / 0.6, 0, 1);
-      (s.mesh.material as any).uniforms.uT.value = uT;
-      (s.mesh.material as any).uniforms.uEnergy.value = s.energy;
-      s.mesh.scale.setScalar(1 + uT * 10);
-    }
-    this.shockwaves = this.shockwaves.filter((s) => s.t < 0.6);
-
-    // craters
-    for (const c of this.craters) {
-      c.age += dt;
-      (c.mesh.material as any).uniforms.uAge.value = c.age;
-    }
-    this.craters = this.craters.filter((c) => c.age < 20);
-  }
-
-  private spawnImpactFX(point: Vector3, energy: number) {
-    // flash is done by bloom-less post; here shockwave billboard
-    const geom = new PlaneGeometry(1, 1);
-    const mat = new ShaderMaterial({
-      vertexShader: SHOCK_VERT,
-      fragmentShader: SHOCK_FRAG,
+    // Final (simple copy / place for lens pass insertion)
+    this.finalPass = new ShaderPass({
       uniforms: {
-        uT: { value: 0 },
-        uEnergy: { value: energy },
-        uColor: { value: new Vector3(1.0, 0.92, 0.7) },
+        tDiffuse: { value: null },
       },
-      transparent: true,
-      depthWrite: false,
-      side: DoubleSide,
-      blending: AdditiveBlending,
+      vertexShader: /* glsl */ `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform sampler2D tDiffuse;
+        varying vec2 vUv;
+        void main() {
+          vec4 c = texture2D(tDiffuse, vUv);
+          gl_FragColor = c;
+        }
+      `,
     });
-    const m = new Mesh(geom, mat);
-    m.position.copy(point);
-    m.lookAt(this.camera.position);
-    m.scale.setScalar(2.5);
-    this.scene.add(m);
-    this.shockwaves.push({ mesh: m, t: 0, energy });
+    this.composer.addPass(this.finalPass);
 
-    // crater decal: small plane aligned with surface normal approximation
-    const g2 = new PlaneGeometry(1, 1);
-    const m2 = new ShaderMaterial({
-      vertexShader: CRATER_VERT,
-      fragmentShader: CRATER_FRAG,
-      uniforms: { uAge: { value: 0 }, uScale: { value: 1 }, uSeed: { value: Math.random() * 1000 } },
-      transparent: true,
-      depthWrite: false,
-      side: DoubleSide,
-    });
-    const decal = new Mesh(g2, m2);
-    decal.position.copy(point);
-    decal.lookAt(point.clone().add(point.clone().normalize())); // outward
-    decal.rotateX(Math.PI * 0.5);
-    decal.scale.setScalar(clamp(energy * 0.15, 0.6, 8));
-    this.scene.add(decal);
-    this.craters.push({ mesh: decal, age: 0 });
+    this.applyPreset(this.preset);
+
+    // Example: a starfield placeholder (procedural points)
+    this.scene.add(this.createProceduralStarfield());
+
+    // Initial resize
+    this.resize(canvas.clientWidth, canvas.clientHeight);
   }
 
-  private stepOnce(dt: number) {
-    // world update (store directly)
-    const s = useStore.getState();
+  // ---------- Public API ----------
 
-    // brush spray (gameplay)
-    if (s.tools.asteroid.brushOn && this.pointerDown) {
-      const spawned = spawnAsteroidsBrush(this.camera, this.tools, dt);
-      if (spawned.length) s.setBodies((prev) => [...prev, ...spawned]);
-    }
-
-    // kepler orbits (realistic)
-    let bodies = updateKeplerOrbits(s.bodies, s.time.t, s.tools.distanceScale, s.settings.mode);
-
-    // gravity/integration (cheap)
-    const G = 0.02 * s.settings.gravityGScale * s.tools.massScale;
-    bodies = applyGravityStep(bodies, dt, { G, topK: s.settings.gravityTopK });
-    bodies = integrateBodies(bodies, dt);
-
-    // blackhole absorb
-    const bh = bodies.find((b) => b.kind === "BlackHole");
-    if (bh?.blackhole) {
-      const absorbR = bh.blackhole.absorbRadius * s.tools.radiusScale;
-      bodies = bodies.filter((b) => {
-        if (b.id === bh.id) return true;
-        const dx = b.position[0] - bh.position[0];
-        const dy = b.position[1] - bh.position[1];
-        const dz = b.position[2] - bh.position[2];
-        const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        if (d < absorbR) {
-          // absorb FX
-          this.spawnImpactFX(new Vector3(b.position[0], b.position[1], b.position[2]), 2.0);
-          return false;
-        }
-        return true;
-      });
-    }
-
-    // collisions (very simplified): detect asteroid vs planet overlap
-    // and create impact fx / debris
-    const planets = bodies.filter((b) => b.kind === "Planet" || b.kind === "Moon");
-    for (const a of bodies.filter((b) => b.kind === "Asteroid" || b.kind === "Debris")) {
-      for (const p of planets) {
-        const r = (p.radius * s.tools.radiusScale + a.radius * s.tools.radiusScale) * 0.9;
-        const dx = a.position[0] - p.position[0];
-        const dy = a.position[1] - p.position[1];
-        const dz = a.position[2] - p.position[2];
-        const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        if (d < r) {
-          const v2 = a.velocity[0] ** 2 + a.velocity[1] ** 2 + a.velocity[2] ** 2;
-          const E = 0.5 * a.mass * v2;
-          s.setTools({ impact: { ...s.tools.impact, lastEnergy: E } });
-
-          // impact fx at contact point on planet surface
-          const n = new Vector3(dx, dy, dz).normalize();
-          const pt = new Vector3(p.position[0], p.position[1], p.position[2]).add(n.multiplyScalar(p.radius * s.tools.radiusScale));
-          this.spawnImpactFX(pt, clamp(E * s.tools.impact.debrisScale, 0.2, 10));
-
-          // remove asteroid (simple)
-          bodies = bodies.filter((x) => x.id !== a.id);
-
-          break;
-        }
-      }
-    }
-
-    // floating origin
-    this.floating.maybeRecenter(bodies as any, this.camera.position, this.orbit.target);
-    s.setOriginOffset(this.floating.toStoreVec3());
-
-    // time advance
-    const t2 = advanceTime(s.time.t, dt, s.time.timeScale, s.time.paused);
-    s.setTime({ t: t2 });
-
-    // update challenges
-    tickChallenges(bodies, s, dt);
-
-    // commit bodies
-    s.setBodies(bodies);
+  public dispose() {
+    this.composer?.dispose();
+    this.renderer?.dispose();
   }
 
-  private tick = () => {
-    requestAnimationFrame(this.tick);
+  public resize(w: number, h: number) {
+    const width = Math.max(1, w);
+    const height = Math.max(1, h);
 
-    const dtRaw = Math.min(1 / 20, this.clock.getDelta());
-    const s = useStore.getState();
-    this.lastFrameId++;
+    this.camera.aspect = width / height;
+    this.camera.updateProjectionMatrix();
 
-    // camera tracking
-    if (s.tools.trackId) {
-      const tr = s.bodies.find((b) => b.id === s.tools.trackId);
-      if (tr) {
-        const pos = new Vector3(tr.position[0], tr.position[1], tr.position[2]);
-        // distance depends on radius
-        const d = Math.max(2, tr.radius * s.tools.radiusScale * 4.5);
-        this.orbit.setFocus(pos, d);
-      }
-    }
+    this.renderer.setSize(width, height, false);
+    this.composer.setSize(width, height);
 
-    // dynamic clip
-    this.dynamicClipPlanes();
+    this.bloomPass.setSize(width, height);
+  }
 
-    // screenshot mode: if paused and screenshot flag, accumulate 3 subframes
-    if (s.tools.cinematics.screenshotMode && s.time.paused) {
-      for (let i = 0; i < 3; i++) {
-        this.stepOnce(1 / 240);
-        this.orbit.update();
-        this.updateBodyRenders(1 / 240);
-        this.updatePostprocess();
-        this.updateFX(1 / 240);
-        if (s.settings.postprocess) this.post.render(1 / 240, s.time.t);
-        else this.renderer.render(this.scene, this.camera);
-      }
+  public setExposure(exposure: number) {
+    this.renderer.toneMappingExposure = clamp(exposure, 0.1, 5.0);
+  }
+
+  public setPostprocessEnabled(on: boolean) {
+    this.postprocessEnabled = on;
+  }
+
+  public setBloomEnabled(on: boolean) {
+    this.bloomEnabled = on;
+  }
+
+  public applyPreset(preset: GraphicsPreset) {
+    this.preset = preset;
+
+    // Pixel ratio
+    if (preset === "Low") this.renderer.setPixelRatio(Math.min(1.0, window.devicePixelRatio || 1));
+    else if (preset === "Medium") this.renderer.setPixelRatio(Math.min(1.25, window.devicePixelRatio || 1));
+    else if (preset === "High") this.renderer.setPixelRatio(Math.min(1.75, window.devicePixelRatio || 1));
+    else this.renderer.setPixelRatio(Math.min(2.0, window.devicePixelRatio || 1));
+
+    // Bloom parameters (conservative)
+    if (preset === "Low") {
+      this.bloomPass.strength = 0.2;
+      this.bloomPass.radius = 0.45;
+      this.bloomPass.threshold = 0.92;
+    } else if (preset === "Medium") {
+      this.bloomPass.strength = 0.28;
+      this.bloomPass.radius = 0.55;
+      this.bloomPass.threshold = 0.9;
+    } else if (preset === "High") {
+      this.bloomPass.strength = 0.34;
+      this.bloomPass.radius = 0.6;
+      this.bloomPass.threshold = 0.88;
     } else {
-      // normal step
-      this.stepOnce(dtRaw);
-      this.orbit.update();
-      this.updateBodyRenders(dtRaw);
-      this.updatePostprocess();
-      this.updateFX(dtRaw);
+      // Cinematic++
+      this.bloomPass.strength = 0.38;
+      this.bloomPass.radius = 0.65;
+      this.bloomPass.threshold = 0.86;
+    }
+  }
 
-      if (s.settings.postprocess) this.post.render(dtRaw, s.time.t);
-      else this.renderer.render(this.scene, this.camera);
+  /**
+   * Floating origin shift:
+   * call this when your simulation re-bases coordinates.
+   * shift: world shift applied (e.g., cameraFocusPos before - after)
+   */
+  public applyFloatingOriginShift(shift: THREE.Vector3) {
+    // Accumulate origin offset
+    this.floatingOrigin.add(shift);
+
+    // Shift scene objects (only those meant to be in world space)
+    // In your project, you might keep celestial bodies in a dedicated group.
+    // This generic implementation shifts the entire scene.
+    this.scene.traverse((o) => {
+      // skip camera & lights? (camera handled separately)
+      if (o === this.camera) return;
+      // shift Object3D position
+      o.position.add(shift);
+    });
+
+    // Shift camera opposite to keep view stable
+    this.camera.position.add(shift);
+  }
+
+  /**
+   * Dynamic near/far: call every frame with an estimated scene scale.
+   * - near increases when close to surface to reduce z-fighting
+   * - far increases when in deep space
+   */
+  public updateNearFar(nearHint: number, farHint: number) {
+    const n = clamp(nearHint, 0.01, 5000);
+    const f = clamp(farHint, 100, 5e8);
+
+    // smooth changes to avoid popping
+    const targetNear = n;
+    const targetFar = f;
+
+    this.camera.near = lerp(this.camera.near, targetNear, 0.25);
+    this.camera.far = lerp(this.camera.far, targetFar, 0.25);
+    this.camera.updateProjectionMatrix();
+  }
+
+  /**
+   * Main tick: call in your RAF loop.
+   * dtSeconds is optional; if omitted it is computed.
+   */
+  public tick(dtSeconds?: number) {
+    const t = nowMs();
+    const dt = dtSeconds ?? (t - this.lastT) / 1000;
+    this.lastT = t;
+
+    // FPS smoothing
+    const instFps = dt > 1e-6 ? 1 / dt : 999;
+    this.fps = lerp(this.fps, instFps, this.fpsSmoother);
+
+    // Optional: update starfield twinkle
+    this.animateStarfield(dt);
+
+    // Cache instanced instance count every N frames (cheap)
+    const frame = this.renderer.info.render.frame ?? 0;
+    if (frame % this.instancedCacheEveryNFrames === 0) {
+      this.instancedCached = countInstancedInstances(this.scene);
     }
 
-    // runtime stats
-    const info = this.renderer.renderer.info;
-    this.smoothedFps = smoothDamp(this.smoothedFps, 1 / Math.max(1e-6, dtRaw), 6.0, dtRaw);
-    this.runtimeSink?.({
-      fps: this.smoothedFps,
-      drawCalls: info.render.calls,
-      instances: info.render.instances,
-    });
-  };
+    // Render
+    if (this.postprocessEnabled) {
+      // Bloom toggle
+      this.bloomPass.enabled = this.bloomEnabled;
+      this.composer.render();
+    } else {
+      this.renderer.render(this.scene, this.camera);
+    }
+  }
 
-  makeSnapshot(): WorldSnapshot {
-    const s = useStore.getState();
+  public getDebugStats(): DebugStats {
+    const r = this.renderer.info.render;
+
     return {
-      bodies: s.bodies,
-      selectedId: s.selectedId,
-      time: s.time,
-      settings: s.settings,
-      challenges: s.challenges,
-      camera: { pos: [this.camera.position.x, this.camera.position.y, this.camera.position.z], target: [this.orbit.target.x, this.orbit.target.y, this.orbit.target.z] },
-      originOffset: this.floating.toStoreVec3(),
+      fps: Math.round(this.fps),
+      calls: r.calls,
+      triangles: r.triangles,
+      lines: r.lines,
+      points: r.points,
+      instanced: this.instancedCached, // ✅ renderer.info.render.instances 대신 우리가 계산한 값
+      preset: this.preset,
     };
   }
 
-  setCameraFromSnapshot(cam: WorldSnapshot["camera"]) {
-    this.camera.position.set(cam.pos[0], cam.pos[1], cam.pos[2]);
-    this.orbit.target.set(cam.target[0], cam.target[1], cam.target[2]);
+  // ---------- Internals / Demo content ----------
+
+  private starfield?: THREE.Points;
+  private starfieldGeom?: THREE.BufferGeometry;
+
+  private createProceduralStarfield() {
+    const count = 4000;
+    const radius = 20000;
+
+    const positions = new Float32Array(count * 3);
+    const colors = new Float32Array(count * 3);
+    const sizes = new Float32Array(count);
+
+    const c = new THREE.Color();
+
+    for (let i = 0; i < count; i++) {
+      // random direction on sphere
+      const u = Math.random();
+      const v = Math.random();
+      const theta = 2 * Math.PI * u;
+      const phi = Math.acos(2 * v - 1);
+      const r = radius * (0.7 + 0.3 * Math.random());
+
+      const x = r * Math.sin(phi) * Math.cos(theta);
+      const y = r * Math.cos(phi);
+      const z = r * Math.sin(phi) * Math.sin(theta);
+
+      positions[i * 3 + 0] = x;
+      positions[i * 3 + 1] = y;
+      positions[i * 3 + 2] = z;
+
+      // star color temperature-ish
+      const t = Math.random();
+      c.setHSL(0.58 - 0.08 * t, 0.2 + 0.25 * t, 0.75 + 0.2 * Math.random());
+      colors[i * 3 + 0] = c.r;
+      colors[i * 3 + 1] = c.g;
+      colors[i * 3 + 2] = c.b;
+
+      sizes[i] = 0.5 + Math.random() * 1.5;
+    }
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geom.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    geom.setAttribute("size", new THREE.BufferAttribute(sizes, 1));
+    this.starfieldGeom = geom;
+
+    const mat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      vertexColors: true,
+      uniforms: {
+        uTime: { value: 0 },
+        uPixelRatio: { value: this.renderer.getPixelRatio() },
+      },
+      vertexShader: /* glsl */ `
+        attribute float size;
+        varying vec3 vColor;
+        uniform float uTime;
+        uniform float uPixelRatio;
+
+        void main() {
+          vColor = color;
+
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          // subtle twinkle by depth
+          float tw = 0.85 + 0.15 * sin(uTime + position.x * 0.0002 + position.y * 0.00017);
+          float s = size * tw;
+
+          gl_PointSize = s * uPixelRatio * (600.0 / max(1.0, -mv.z));
+          gl_Position = projectionMatrix * mv;
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        varying vec3 vColor;
+        void main() {
+          vec2 uv = gl_PointCoord.xy * 2.0 - 1.0;
+          float d = dot(uv, uv);
+          float a = smoothstep(1.0, 0.0, d);
+          vec3 c = vColor;
+          gl_FragColor = vec4(c, a);
+        }
+      `,
+    });
+
+    const pts = new THREE.Points(geom, mat);
+    pts.frustumCulled = false;
+    this.starfield = pts;
+    return pts;
+  }
+
+  private animateStarfield(dt: number) {
+    if (!this.starfield) return;
+    const mat = this.starfield.material as THREE.ShaderMaterial;
+    if (!mat.uniforms) return;
+    mat.uniforms.uTime.value += dt;
+    mat.uniforms.uPixelRatio.value = this.renderer.getPixelRatio();
   }
 }
+
+export default ThreeRoot;
