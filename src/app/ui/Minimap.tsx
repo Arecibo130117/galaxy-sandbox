@@ -1,21 +1,17 @@
 import React, { useMemo } from "react";
-import { useStore } from "../store";
+import { useStore } from "../state/store";
 
 /**
- * Minimap (2D) - Sun-centered orbit layout
- * - Orbit ring: only if body.orbit exists
- * - Body dot: uses precomputed minimap position if present, else derives from body.position
+ * Minimap (Sun-centered orbit overview)
+ * - Orbit rings: only render when body.orbit exists
+ * - Dots: use body.minimap if exists; else project body.position onto XZ
  *
- * NOTE:
- * Your store shape might differ. This file is written defensively:
- *  - selectors are typed as any so TS won't fail if your zustand store typing is strict.
- *  - expected body fields (id, name, orbit?, position?, minimap?) are read safely.
+ * Defensive typing to avoid strict TS issues in UI.
  */
 
 type Orbit = {
-  a: number; // semi-major axis (in your scaled units)
-  e: number; // eccentricity
-  // optionally: i, omega, w, M0, period, etc.
+  a: number;
+  e: number;
 };
 
 type Vec3Like = { x: number; y: number; z: number };
@@ -24,10 +20,12 @@ type BodyLike = {
   id: string;
   name?: string;
   type?: string;
-  orbit?: Orbit;
-  position?: Vec3Like; // world position (floating-origin space)
-  minimap?: { x: number; y: number }; // optional precomputed minimap coords
   enabled?: boolean;
+
+  orbit?: Orbit;
+
+  position?: Vec3Like; // world (floating-origin) position
+  minimap?: { x: number; y: number }; // optional precomputed minimap coord
   color?: string;
 };
 
@@ -43,26 +41,22 @@ function ellipseRadiiFromOrbit(a: number, e: number) {
 }
 
 export function Minimap() {
-  // Defensive selectors (adapt these selectors if your store shape differs)
   const bodies: BodyLike[] = useStore((s: any) => s.bodies ?? s.world?.bodies ?? []);
-  const focusId: string | null = useStore((s: any) => s.camera?.focusId ?? s.cameraFocusId ?? null);
+  const focusId: string | null = useStore((s: any) => s.camera?.focusId ?? null);
 
-  // Independent scales from UI if you keep them in store (optional)
+  // Optional: distance scale
   const distanceScale: number = useStore((s: any) => s.scales?.distance ?? s.distanceScale ?? 1);
 
   const prepared = useMemo(() => {
-    // Compute minimap positions + orbit radii in normalized minimap space
-    // We draw in SVG viewBox = [-1..1], so we normalize by maxOrbitA
-    const enabledBodies = bodies.filter((b) => b && (b.enabled ?? true));
+    const enabledBodies = (bodies ?? []).filter((b) => b && (b.enabled ?? true));
 
-    // Determine reference max distance: prefer max orbit.a, else position length
+    // Determine normalizing radius (max orbit a, fallback to position radius)
     let maxA = 0.001;
     for (const b of enabledBodies) {
       const a = b.orbit?.a ?? 0;
       if (a > maxA) maxA = a;
     }
     if (maxA <= 0.001) {
-      // fallback to positions
       for (const b of enabledBodies) {
         const p = b.position;
         if (!p) continue;
@@ -71,7 +65,6 @@ export function Minimap() {
       }
     }
 
-    // apply UI distance scale (minimap should reflect current scaling)
     const denom = Math.max(1e-6, maxA * Math.max(1e-6, distanceScale));
 
     return enabledBodies.map((b) => {
@@ -81,9 +74,7 @@ export function Minimap() {
 
       const { rx, ry } = hasOrbit ? ellipseRadiiFromOrbit(a / denom, e) : { rx: 0, ry: 0 };
 
-      // dot position:
-      // 1) use b.minimap if exists
-      // 2) else use world position projected onto XZ plane
+      // dot pos
       let x = 0;
       let y = 0;
 
@@ -94,12 +85,11 @@ export function Minimap() {
         x = (b.position.x / denom) * 0.95;
         y = (b.position.z / denom) * 0.95;
       } else if (hasOrbit) {
-        // fallback: place on +x axis at radius ~a (just so it shows)
         x = (a / denom) * 0.95;
         y = 0;
       }
 
-      // clamp inside view
+      // clamp
       const L = Math.sqrt(x * x + y * y);
       if (L > 0.98) {
         const k = 0.98 / L;
@@ -110,8 +100,6 @@ export function Minimap() {
       return {
         ...b,
         hasOrbit,
-        aNorm: a / denom,
-        e,
         rx,
         ry,
         dotX: x,
@@ -123,16 +111,14 @@ export function Minimap() {
   return (
     <div className="w-full h-full rounded-lg border border-white/10 bg-black/30">
       <svg viewBox="-1 -1 2 2" className="w-full h-full">
-        {/* Sun marker at center */}
+        {/* Sun center */}
         <circle cx={0} cy={0} r={0.03} fill="rgba(255,220,140,0.95)" />
         <circle cx={0} cy={0} r={0.06} fill="none" stroke="rgba(255,220,140,0.25)" strokeWidth={0.01} />
 
-        {/* Orbit rings (only if orbit exists) */}
+        {/* Orbit rings */}
         {prepared.map((b) => {
-          if (!b.hasOrbit) return null; // ✅ TS18048 해결: orbit 없는 경우 스킵
+          if (!b.hasOrbit) return null; // ✅ orbit 없는 경우 스킵 (TS18048 해결)
 
-          // In a real minimap you may want to offset ellipse focus for eccentricity.
-          // Here we draw a clean ellipse centered at origin for readability.
           return (
             <ellipse
               key={`orbit-${b.id}`}
@@ -152,7 +138,6 @@ export function Minimap() {
           const isFocus = b.id === focusId;
           const r = isFocus ? 0.022 : 0.014;
 
-          // simple color logic
           const fill =
             b.color ??
             (b.type === "sun"
